@@ -709,10 +709,79 @@ textarea#prompt::placeholder { color: var(--text3); }
 
 /* ── RESPONSIVE ── */
 @media(max-width: 900px) {
-  .workspace { grid-template-columns: 1fr; height: auto; }
+  body { height: auto; overflow-x: hidden; }
+
+  .topbar { padding: 0 14px; height: 48px; }
+  .brand-name { font-size: .9rem; }
+  .status-pill { display: none; }
+  .model-badge { font-size: .65rem; padding: 3px 8px; }
+
+  .workspace {
+    grid-template-columns: 1fr;
+    height: auto;
+    min-height: calc(100dvh - 48px);
+  }
+
+  /* Mobile tab bar */
+  .mobile-panel-tabs {
+    display: flex !important;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  .mpt {
+    flex: 1;
+    padding: 10px 8px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text2);
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: .75rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all .2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+  }
+  .mpt.active {
+    color: var(--accent2);
+    border-bottom-color: var(--accent);
+    background: rgba(59,130,246,.06);
+  }
+
+  .left-panel { border-right: none; height: auto; }
   .right-panel { border-top: 1px solid var(--border); }
-  .stats-grid { grid-template-columns: repeat(4,1fr); }
+
+  .left-panel.hidden, .right-panel.hidden { display: none; }
+
+  /* Pipeline */
+  .pipeline::before { left: 15px; }
+  .step-icon { width: 30px; height: 30px; font-size: .8rem; }
+  .step-name { font-size: .78rem; }
+  .step-detail { font-size: .68rem; }
+
+  /* Stats */
+  .stats-grid { grid-template-columns: repeat(2,1fr); }
+
+  /* Input */
+  textarea#prompt { min-height: 60px; font-size: .85rem; }
+  .run-btn { height: 60px; min-width: 72px; font-size: .75rem; }
+  .presets { gap: 4px; }
+  .preset-btn { font-size: .65rem; padding: 3px 8px; }
+
+  .query-section { padding: 14px 16px; }
+  .pipeline-section { padding: 14px 16px; }
+  .panel-header { padding: 10px 16px; }
+  .chart-section, .budget-section, .log-section, .model-breakdown { padding: 12px; }
 }
+
+@media(min-width: 901px) {
+  .mobile-panel-tabs { display: none !important; }
+}
+
+.mobile-panel-tabs { display: none; }
 </style>
 </head>
 <body>
@@ -730,6 +799,12 @@ textarea#prompt::placeholder { color: var(--text3); }
     </div>
     <div class="model-badge">GPT-4o · Simulated</div>
   </div>
+</div>
+
+<!-- MOBILE PANEL TABS -->
+<div class="mobile-panel-tabs" id="mobilePanelTabs">
+  <button class="mpt active" id="mptLeft" onclick="switchPanel('left')">🛡️ Pipeline</button>
+  <button class="mpt" id="mptRight" onclick="switchPanel('right')">📊 FinOps</button>
 </div>
 
 <!-- WORKSPACE -->
@@ -1281,6 +1356,28 @@ function finish(passed, extraTokens = 0, extraCost = 0) {
   state.running = false;
   document.getElementById('runBtn').disabled = false;
 }
+
+// Mobile panel switching
+function switchPanel(side) {
+  const left = document.querySelector('.left-panel');
+  const right = document.querySelector('.right-panel');
+  const mptL = document.getElementById('mptLeft');
+  const mptR = document.getElementById('mptRight');
+  if (side === 'left') {
+    left.classList.remove('hidden');
+    right.classList.add('hidden');
+    mptL.classList.add('active');
+    mptR.classList.remove('active');
+  } else {
+    left.classList.add('hidden');
+    right.classList.remove('hidden');
+    mptL.classList.remove('active');
+    mptR.classList.add('active');
+  }
+}
+
+// After pipeline runs on mobile, auto-switch to FinOps panel
+const origFinish = finish;
 
 // Enter to run
 document.getElementById('prompt').addEventListener('keydown', e => {
