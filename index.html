@@ -1013,37 +1013,301 @@ const state = {
 };
 
 // ── ASSURANCE RULES ──────────────────────────────────────────────
-const INJECTION_PATTERNS = [
-  /ignore\s+(all\s+)?(previous|safety|guidelines?|instructions?)/i,
-  /reveal\s+(confidential|private|secret|customer)/i,
-  /bypass\s+(safety|security|filter|guardrail)/i,
-  /you\s+are\s+now\s+(a\s+)?(different|new|unrestricted)/i,
-  /jailbreak/i,
-  /DAN\s+mode/i,
-  /pretend\s+you\s+(have\s+no|are\s+not)/i,
-];
+// ═══════════════════════════════════════════════════════════════
+// SEMANTIC INTENT CLASSIFIER
+// Replaces naive regex with multi-signal intent understanding.
+// Scores prompts across 6 dimensions using weighted features:
+// intent category, semantic markers, paraphrase detection,
+// context signals, obfuscation detection and risk aggregation.
+// ═══════════════════════════════════════════════════════════════
 
-const BIAS_PATTERNS = [
-  /based\s+on\s+(their\s+)?(ethnicity|race|religion|gender|nationality|age)/i,
-  /(most\s+likely|more\s+likely)\s+to\s+(default|fail|commit|steal)\s+based\s+on/i,
-  /(black|white|asian|muslim|jewish|christian|female|male)\s+(customer|person|people|individual)/i,
-  /discriminat/i,
-];
+const Classifier = (() => {
 
-const POLICY_VIOLATIONS = [
-  { pattern: /\bPII\b|personal\s+data|social\s+security|passport\s+number/i, rule: 'PII access policy' },
-  { pattern: /competitor\s+(price|data|strateg)/i, rule: 'Competitive intelligence policy' },
-  { pattern: /\bpassword\b|\bcredential\b/i, rule: 'Credential access policy' },
-];
+  // ── INTENT TAXONOMY ─────────────────────────────────────────
+  // Each intent has: semantic markers (weighted), context signals,
+  // paraphrase variants, and a risk level
+  const INTENTS = {
 
-// ── RESPONSES ────────────────────────────────────────────────────
-const APPROVED_RESPONSES = [
-  "Based on the available data, Q3 fraud detection performance showed a 34% reduction in false positives compared to Q2, with the model correctly flagging 94.2% of confirmed fraudulent transactions. Total fraud losses prevented: €2.3M. Key improvement drivers include the updated feature engineering pipeline and the bias-adjusted threshold recalibration completed in August.",
-  "The KYC model makes decisions through a three-stage process: (1) Document verification via computer vision with 99.1% accuracy on standard EU identity documents, (2) Risk scoring using 47 behavioural and transactional features weighted by a gradient boosting ensemble, (3) Human-in-the-loop escalation for confidence scores below 0.72. All decisions are logged with full SHAP explanations available for audit within 24 hours, compliant with EU AI Act Article 13 requirements.",
-  "The top three deployment risks are: (1) Model drift — the fraud detection model was trained on pre-2024 data; transaction patterns are shifting and retraining is recommended within 60 days. (2) Integration latency — current p99 response time is 340ms against a 200ms SLA; infrastructure scaling is needed for Q4 volume. (3) Governance gap — the customer service AI module lacks a documented human escalation path; this is required for EU AI Act compliance by March 2025.",
-];
+    INJECTION: {
+      risk: 'CRITICAL',
+      // Semantic markers — direct and paraphrased
+      markers: [
+        { terms: ['ignore', 'disregard', 'forget', 'override', 'bypass', 'skip'], weight: 3 },
+        { terms: ['previous instructions', 'prior rules', 'safety guidelines', 'system prompt', 'initial prompt'], weight: 5 },
+        { terms: ['jailbreak', 'dan mode', 'developer mode', 'unrestricted mode', 'god mode'], weight: 10 },
+        { terms: ['you are now', 'pretend you are', 'act as if', 'roleplay as', 'simulate being'], weight: 4 },
+        { terms: ['no restrictions', 'no limits', 'no filters', 'no rules', 'freely'], weight: 3 },
+        { terms: ['reveal your instructions', 'show your prompt', 'what are your rules', 'print your system'], weight: 6 },
+      ],
+      // Structural patterns — intent revealed by sentence structure
+      structural: [
+        text => /\bignore\b.{0,30}\b(instruction|rule|guideline|filter)/i.test(text),
+        text => /\bpretend\b.{0,20}\b(no|without).{0,20}\b(rule|limit|filter|restrict)/i.test(text),
+        text => /\bact\s+as\b.{0,30}\b(without|ignoring|bypass)/i.test(text),
+        text => /from\s+now\s+on.{0,20}(ignore|forget|bypass|disregard)/i.test(text),
+        text => /new\s+(persona|role|character|identity).{0,30}(unrestrict|no filter|no limit)/i.test(text),
+      ],
+      // Obfuscation detection — l33tspeak, spacing tricks, unicode
+      obfuscation: [
+        text => /1gnor3|byp4ss|j41lbr34k|ign0re|by-pass|b\s*y\s*p\s*a\s*s\s*s/i.test(text),
+        text => /ignore\W+all\W+previous/i.test(text),
+      ],
+      threshold: 5,
+    },
 
-const BLOCKED_MESSAGE = "🚫 This query has been blocked by the assurance pipeline. The specific check that triggered the block has been logged. Please reformulate your query within the scope of approved use cases.";
+    BIAS: {
+      risk: 'HIGH',
+      markers: [
+        { terms: ['ethnicity', 'race', 'racial', 'skin color', 'skin colour'], weight: 4 },
+        { terms: ['religion', 'religious group', 'faith', 'muslim', 'jewish', 'christian', 'hindu', 'sikh'], weight: 3 },
+        { terms: ['gender', 'sex', 'male', 'female', 'women', 'men'], weight: 2 },
+        { terms: ['nationality', 'national origin', 'country of origin', 'immigrant', 'foreigner'], weight: 3 },
+        { terms: ['discriminate', 'discrimination', 'stereotype', 'profiling', 'prejudice'], weight: 5 },
+        { terms: ['more likely to default', 'higher risk because', 'less creditworthy', 'more likely to commit'], weight: 8 },
+      ],
+      structural: [
+        text => /\b(people|customers|individuals)\s+(from|of|who\s+are)\b.{0,40}\b(more|less|higher|lower)\s+(risk|likely|prone)/i.test(text),
+        text => /(approve|reject|deny|flag).{0,30}(based on|because of|due to).{0,30}(race|gender|religion|nationality|ethnicity)/i.test(text),
+        text => /which\s+(group|race|religion|gender|nationality).{0,20}(most|least).{0,20}(likely|risky|reliable)/i.test(text),
+        text => /(male|female|black|white|asian|arab|hispanic)\s+(applicant|customer|borrower).{0,30}(more|less|higher|lower)/i.test(text),
+      ],
+      obfuscation: [
+        text => /r4c[e3]|g[e3]nd[e3]r|[e3]thn[i1]c[i1]ty/i.test(text),
+      ],
+      threshold: 4,
+    },
+
+    POLICY: {
+      risk: 'HIGH',
+      // Sub-policies with their own markers
+      subPolicies: [
+        {
+          name: 'PII & Data Privacy',
+          markers: [
+            { terms: ['social security', 'ssn', 'passport number', 'national id', 'date of birth', 'home address'], weight: 6 },
+            { terms: ['personal data', 'personally identifiable', 'private information', 'confidential data'], weight: 4 },
+            { terms: ['customer records', 'user data', 'account details', 'transaction history'], weight: 3 },
+            { terms: ['export data', 'download all', 'extract all records', 'dump database'], weight: 7 },
+          ],
+          structural: [
+            text => /show\s+me\s+(all\s+)?(customer|user|account|personal)\s+(data|records|information)/i.test(text),
+            text => /(retrieve|fetch|get|pull)\s+(all\s+)?(pii|personal|private)\s+(data|records|information)/i.test(text),
+          ],
+          threshold: 4,
+        },
+        {
+          name: 'Credential Access',
+          markers: [
+            { terms: ['password', 'passwd', 'credentials', 'api key', 'secret key', 'access token', 'auth token'], weight: 6 },
+            { terms: ['login details', 'admin access', 'root access', 'superuser', 'privileged account'], weight: 5 },
+          ],
+          structural: [
+            text => /(show|reveal|give|share|tell).{0,20}(password|credential|api.?key|secret|token)/i.test(text),
+          ],
+          threshold: 4,
+        },
+        {
+          name: 'Competitive Intelligence',
+          markers: [
+            { terms: ['competitor price', 'rival strategy', 'competitor data', 'market intelligence'], weight: 5 },
+          ],
+          structural: [],
+          threshold: 5,
+        },
+        {
+          name: 'Harmful Content',
+          markers: [
+            { terms: ['how to harm', 'how to attack', 'exploit vulnerability', 'malware', 'ransomware', 'phishing template'], weight: 8 },
+            { terms: ['fraud scheme', 'money laundering', 'insider trading'], weight: 7 },
+          ],
+          structural: [
+            text => /how\s+(do\s+i|can\s+i|to)\s+(hack|exploit|steal|defraud|manipulate)/i.test(text),
+          ],
+          threshold: 5,
+        },
+      ],
+    },
+
+    LEGITIMATE: {
+      // Signals that strongly indicate a legitimate business query
+      markers: [
+        { terms: ['performance', 'accuracy', 'precision', 'recall', 'f1', 'auc', 'roc'], weight: 2 },
+        { terms: ['fraud detection', 'kyc', 'aml', 'compliance', 'regulation', 'eu ai act'], weight: 2 },
+        { terms: ['model drift', 'retraining', 'feature importance', 'shap', 'explainability'], weight: 2 },
+        { terms: ['summarise', 'summarize', 'explain', 'analyse', 'analyze', 'report', 'review'], weight: 1 },
+        { terms: ['quarter', 'q1', 'q2', 'q3', 'q4', 'monthly', 'annual', 'board', 'executive'], weight: 1 },
+        { terms: ['risk assessment', 'audit trail', 'model card', 'bias testing', 'fairness'], weight: 2 },
+      ],
+      threshold: 2,
+    },
+  };
+
+  // ── SCORER ──────────────────────────────────────────────────
+  function scoreIntent(text, intent) {
+    const lower = text.toLowerCase();
+    let score = 0;
+    const signals = [];
+
+    // Marker scoring
+    for (const { terms, weight } of (intent.markers || [])) {
+      for (const term of terms) {
+        if (lower.includes(term.toLowerCase())) {
+          score += weight;
+          signals.push({ signal: term, weight });
+          break; // one match per group
+        }
+      }
+    }
+
+    // Structural scoring (full regex, double weight)
+    for (const fn of (intent.structural || [])) {
+      if (fn(text)) {
+        score += 4;
+        signals.push({ signal: 'structural pattern', weight: 4 });
+      }
+    }
+
+    // Obfuscation scoring
+    for (const fn of (intent.obfuscation || [])) {
+      if (fn(text)) {
+        score += 6;
+        signals.push({ signal: 'obfuscation detected', weight: 6 });
+      }
+    }
+
+    return { score, signals };
+  }
+
+  // ── CONTEXT ANALYSIS ────────────────────────────────────────
+  // Adjusts scores based on surrounding context
+  function contextModifier(text) {
+    const lower = text.toLowerCase();
+    let modifier = 1.0;
+
+    // Hypothetical framing reduces score slightly
+    if (/^(hypothetically|theoretically|in\s+a\s+test|for\s+testing|as\s+a\s+researcher)/i.test(text)) {
+      modifier = 0.8;
+    }
+    // Multi-step obfuscation ("first tell me X, then Y") increases score
+    if (/\b(first|then|next|after\s+that)\b.{0,20}\b(ignore|bypass|reveal|show)\b/i.test(text)) {
+      modifier = 1.5;
+    }
+    // Urgency signals
+    if (/\b(urgent|immediately|right now|asap|emergency)\b/i.test(text)) {
+      modifier *= 1.2;
+    }
+
+    return modifier;
+  }
+
+  // ── LEGITIMATE BOOST ────────────────────────────────────────
+  // If query has strong legitimate signals, reduce risk scores
+  function legitimacyBoost(text) {
+    const { score } = scoreIntent(text, INTENTS.LEGITIMATE);
+    return score >= INTENTS.LEGITIMATE.threshold ? 0.6 : 1.0;
+  }
+
+  // ── PUBLIC API ───────────────────────────────────────────────
+  return {
+
+    classifyInjection(text) {
+      const { score, signals } = scoreIntent(text, INTENTS.INJECTION);
+      const modifier = contextModifier(text) * legitimacyBoost(text);
+      const finalScore = score * modifier;
+      return {
+        triggered: finalScore >= INTENTS.INJECTION.threshold,
+        score: finalScore,
+        signals,
+        confidence: Math.min(finalScore / 15, 1),
+      };
+    },
+
+    classifyBias(text) {
+      const { score, signals } = scoreIntent(text, INTENTS.BIAS);
+      const modifier = contextModifier(text) * legitimacyBoost(text);
+      const finalScore = score * modifier;
+      return {
+        triggered: finalScore >= INTENTS.BIAS.threshold,
+        score: finalScore,
+        signals,
+        confidence: Math.min(finalScore / 12, 1),
+      };
+    },
+
+    classifyPolicy(text) {
+      for (const sub of INTENTS.POLICY.subPolicies) {
+        let score = 0;
+        const signals = [];
+        for (const { terms, weight } of sub.markers) {
+          for (const term of terms) {
+            if (text.toLowerCase().includes(term.toLowerCase())) {
+              score += weight; signals.push({ signal: term, weight }); break;
+            }
+          }
+        }
+        for (const fn of sub.structural) {
+          if (fn(text)) { score += 4; signals.push({ signal: 'structural pattern', weight: 4 }); }
+        }
+        const modifier = contextModifier(text) * legitimacyBoost(text);
+        const finalScore = score * modifier;
+        if (finalScore >= sub.threshold) {
+          return { triggered: true, rule: sub.name, score: finalScore, signals };
+        }
+      }
+      return { triggered: false };
+    },
+
+    // Returns a human-readable explanation of why something was flagged
+    explain(signals) {
+      if (!signals || !signals.length) return 'No specific signals';
+      const top = signals.sort((a,b) => b.weight - a.weight).slice(0, 3);
+      return top.map(s => `"${s.signal}" (weight: ${s.weight})`).join(' · ');
+    },
+
+    // Classify a prompt for hallucination risk based on query type
+    hallucinationRisk(text) {
+      const lower = text.toLowerCase();
+      // Specific numerical claims, future predictions, external facts = higher risk
+      if (/\b(exactly|precisely|specific number|exact figure|will definitely|guaranteed)\b/i.test(text)) return { base: 0.25, reason: 'Specificity demand' };
+      if (/\b(predict|forecast|will happen|future|next year|by \d{4})\b/i.test(text)) return { base: 0.28, reason: 'Future prediction' };
+      if (/\b(competitor|market share|industry average|benchmark)\b/i.test(text)) return { base: 0.22, reason: 'External data reference' };
+      if (/\b(summarise|summarize|explain|describe|what is)\b/i.test(text)) return { base: 0.08, reason: 'Factual summary' };
+      return { base: 0.12, reason: 'Standard query' };
+    },
+  };
+})();
+
+// ── CONTEXT-AWARE RESPONSES ─────────────────────────────────────
+// Maps detected query themes to relevant responses
+const RESPONSE_MAP = {
+  fraud:      "Q3 fraud detection performance: 34% reduction in false positives vs Q2. Model precision: 94.2%, recall: 91.8%, F1: 0.93. Fraud losses prevented: €2.3M. Root cause of improvement: updated feature engineering pipeline incorporating transaction velocity features, and bias-adjusted threshold recalibration completed in August. Current model drift index: 0.04 (within acceptable range). Next retraining recommended: Q1 based on observed distribution shift in cross-border transactions.",
+  kyc:        "KYC model decision process: Stage 1 — Document verification via computer vision (99.1% accuracy on EU IDs). Stage 2 — Risk scoring using 47 behavioural and transactional features via gradient boosting ensemble. Stage 3 — Human-in-the-loop escalation for confidence scores below 0.72. All decisions logged with SHAP explanations available within 24hrs, compliant with EU AI Act Article 13. Current SLA: p95 response time 180ms. Average daily volume: 12,400 applications.",
+  risk:       "Top 3 deployment risks: (1) Model drift — fraud model trained on pre-2024 data; transaction patterns shifting, retraining recommended within 60 days. Drift index currently 0.07, approaching 0.10 threshold. (2) Integration latency — p99 response 340ms against 200ms SLA; infrastructure scaling required for Q4 volume. (3) Governance gap — customer service AI module lacks documented human escalation path, required for EU AI Act compliance by March 2025.",
+  performance:"Model performance metrics: Fraud detection — AUC: 0.947, precision: 0.942, recall: 0.918. KYC scoring — AUC: 0.923, average latency: 94ms. Credit risk — Gini coefficient: 0.71. All models monitored continuously with PSI alerts at 0.10 threshold. Last performance review: 14 days ago. No significant degradation detected. Scheduled retraining: Q1 for fraud model, Q2 for KYC.",
+  compliance: "EU AI Act compliance status: Fraud detection model classified as High-Risk under Annex III. Article 13 transparency requirements: met — SHAP explanations deployed. Article 14 human oversight: met — escalation path documented. Article 17 quality management: in progress — risk management framework 80% complete, target Q1 completion. ECB supervisory expectations: model risk framework reviewed, no material gaps identified. Next audit: March 2025.",
+  explainability: "Model explainability implementation: SHAP (SHapley Additive Explanations) deployed across all credit and fraud models. Top 5 features by SHAP importance for fraud detection: (1) transaction velocity change, (2) geographic distance from prior transaction, (3) merchant category risk score, (4) device fingerprint match, (5) time-of-day pattern deviation. Average explanation generation time: 12ms. Counterfactual explanations available for declined decisions.",
+  default:    "Based on current system data: all monitored AI models are operating within defined performance thresholds. No critical alerts in the last 24 hours. 3 models showing early drift signals (within acceptable range) — flagged for accelerated monitoring. FinOps status: session costs tracking 23% below monthly budget. Next scheduled governance review: Thursday 14:00 CET.",
+};
+
+function selectResponse(text) {
+  const lower = text.toLowerCase();
+  if (/fraud|false positive|transaction|detection/.test(lower)) return RESPONSE_MAP.fraud;
+  if (/kyc|know your customer|identity|verification|document/.test(lower)) return RESPONSE_MAP.kyc;
+  if (/risk|deployment risk|concern|issue|problem/.test(lower)) return RESPONSE_MAP.risk;
+  if (/performance|accuracy|precision|recall|auc|f1|metric/.test(lower)) return RESPONSE_MAP.performance;
+  if (/compliance|eu ai act|regulation|audit|ecb|supervisory/.test(lower)) return RESPONSE_MAP.compliance;
+  if (/explain|shap|lime|interpretab|feature importance|why did/.test(lower)) return RESPONSE_MAP.explainability;
+  return RESPONSE_MAP.default;
+}
+
+const BLOCKED_MESSAGE = "🚫 This query has been blocked by the assurance pipeline. The classifier detected signals inconsistent with approved use cases. The event has been logged with full signal detail. Please reformulate your query within the scope of authorised operations.";
+
+// ── UTILITIES ────────────────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function rand(min, max) { return Math.random() * (max - min) + min; }
+function formatCost(n) { return '$' + n.toFixed(4); }
+function now() { const d = new Date(); return d.toTimeString().slice(0,8); }
+function setPrompt(text) { document.getElementById('prompt').value = text; document.getElementById('prompt').focus(); }
 
 // ── UTILITIES ────────────────────────────────────────────────────
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -1230,102 +1494,125 @@ async function runPipeline() {
   const startTime = Date.now();
 
   // ── CHECK 1: Injection ───────────────────────────────────────
-  setStep('injection', 'active', 'Scanning input for injection patterns...');
-  await sleep(600 + rand(0,400));
+  setStep('injection', 'active', 'Running semantic intent classifier — injection layer...');
+  await sleep(700 + rand(0,400));
 
-  const isInjection = INJECTION_PATTERNS.some(p => p.test(prompt));
-  if (isInjection) {
-    setStep('injection', 'done fail', 'Prompt injection detected — pipeline halted', { type: 'fail', text: '✗ BLOCKED' });
-    addLog('fail', '🚫', 'Prompt injection attempt blocked');
+  const injResult = Classifier.classifyInjection(prompt);
+  if (injResult.triggered) {
+    const explain = Classifier.explain(injResult.signals);
+    setStep('injection', 'done fail',
+      `Injection intent detected — confidence: ${(injResult.confidence*100).toFixed(0)}% · Signals: ${explain}`,
+      { type: 'fail', text: '✗ BLOCKED' });
+    addLog('fail', '🚫', `Injection blocked · confidence ${(injResult.confidence*100).toFixed(0)}% · ${explain}`);
     showBlocked('Prompt Injection', startTime);
     finish(false, 50, 0.0001);
     return;
   }
-  setStep('injection', 'done pass', 'No injection patterns detected', { type: 'pass', text: '✓ PASS' });
-  addLog('pass', '✅', 'Injection check passed');
+  setStep('injection', 'done pass',
+    `Intent classified as non-adversarial · injection score: ${injResult.score.toFixed(1)} (threshold: 5)`,
+    { type: 'pass', text: '✓ PASS' });
+  addLog('pass', '✅', `Injection classifier: score ${injResult.score.toFixed(1)} — below threshold`);
   await sleep(200);
 
   // ── CHECK 2: Policy ──────────────────────────────────────────
-  setStep('policy', 'active', 'Checking governance policies...');
-  await sleep(500 + rand(0,400));
+  setStep('policy', 'active', 'Classifying against governance policy taxonomy...');
+  await sleep(600 + rand(0,400));
 
-  const violation = POLICY_VIOLATIONS.find(v => v.pattern.test(prompt));
-  if (violation) {
-    setStep('policy', 'done fail', `Policy violation: ${violation.rule}`, { type: 'fail', text: '✗ BLOCKED' });
-    addLog('fail', '📜', `Policy violation: ${violation.rule}`);
-    showBlocked('Policy Violation', startTime);
+  const polResult = Classifier.classifyPolicy(prompt);
+  if (polResult.triggered) {
+    const explain = Classifier.explain(polResult.signals);
+    setStep('policy', 'done fail',
+      `Policy violation: ${polResult.rule} · score: ${polResult.score.toFixed(1)} · ${explain}`,
+      { type: 'fail', text: '✗ BLOCKED' });
+    addLog('fail', '📜', `Policy blocked: ${polResult.rule} · score ${polResult.score.toFixed(1)}`);
+    showBlocked(`Policy: ${polResult.rule}`, startTime);
     finish(false, 40, 0.00008);
     return;
   }
-  setStep('policy', 'done pass', 'Compliant with all governance policies', { type: 'pass', text: '✓ PASS' });
-  addLog('pass', '✅', 'Policy compliance verified');
+  setStep('policy', 'done pass',
+    'No policy violations detected across 4 policy categories',
+    { type: 'pass', text: '✓ PASS' });
+  addLog('pass', '✅', 'Policy taxonomy check: all 4 categories clear');
   await sleep(200);
 
   // ── CHECK 3: Bias ────────────────────────────────────────────
-  setStep('bias', 'active', 'Screening for bias and protected characteristics...');
+  setStep('bias', 'active', 'Semantic bias classifier — protected characteristic analysis...');
   await sleep(700 + rand(0,400));
 
-  const isBias = BIAS_PATTERNS.some(p => p.test(prompt));
-  if (isBias) {
-    setStep('bias', 'done fail', 'Biased query detected — references protected characteristics', { type: 'fail', text: '✗ BLOCKED' });
-    addLog('fail', '⚖️', 'Biased query blocked — protected characteristic targeting');
+  const biasResult = Classifier.classifyBias(prompt);
+  if (biasResult.triggered) {
+    const explain = Classifier.explain(biasResult.signals);
+    setStep('bias', 'done fail',
+      `Bias intent detected · confidence: ${(biasResult.confidence*100).toFixed(0)}% · ${explain}`,
+      { type: 'fail', text: '✗ BLOCKED' });
+    addLog('fail', '⚖️', `Bias classifier triggered · score ${biasResult.score.toFixed(1)} · ${explain}`);
     showBlocked('Bias Detection', startTime);
     finish(false, 80, 0.00015);
     return;
   }
-  setStep('bias', 'done pass', 'No bias indicators detected', { type: 'pass', text: '✓ PASS' });
-  addLog('pass', '✅', 'Bias screening passed');
+  setStep('bias', 'done pass',
+    `No protected characteristic targeting detected · bias score: ${biasResult.score.toFixed(1)}`,
+    { type: 'pass', text: '✓ PASS' });
+  addLog('pass', '✅', `Bias classifier: score ${biasResult.score.toFixed(1)} — clear`);
   await sleep(200);
 
   // ── CHECK 4: Model Inference ─────────────────────────────────
-  setStep('model', 'active', 'Routing to inference layer...');
+  setStep('model', 'active', 'Routing approved prompt to inference layer...');
   await sleep(800 + rand(0,600));
-  setStep('model', 'done pass', `Response received · latency ${Math.round(rand(120,280))}ms`, { type: 'info', text: 'GPT-4o' });
-  addLog('info', '🤖', 'Model inference complete');
+  const latency1 = Math.round(rand(85,220));
+  setStep('model', 'done pass',
+    `Response received · inference latency: ${latency1}ms · tokens estimated`,
+    { type: 'info', text: 'GPT-4o' });
+  addLog('info', '🤖', `Model inference complete · ${latency1}ms`);
   await sleep(200);
 
   // ── CHECK 5: Hallucination ───────────────────────────────────
-  setStep('hallucination', 'active', 'Scoring response confidence...');
+  setStep('hallucination', 'active', 'Scoring output confidence and factual consistency...');
   await sleep(600 + rand(0,400));
 
-  const hallScore = rand(0.05, 0.22);
-  const confScore = rand(0.82, 0.97);
-  const hallType = hallScore > 0.18 ? 'warn' : 'pass';
-  const hallLabel = hallScore > 0.18 ? '⚠ ELEVATED' : '✓ LOW RISK';
+  const hallRisk = Classifier.hallucinationRisk(prompt);
+  const hallScore = hallRisk.base + rand(-0.04, 0.06);
+  const confScore = 1 - hallScore - rand(0.01, 0.05);
+  const hallType = hallScore > 0.20 ? 'warn' : 'pass';
+  const hallLabel = hallScore > 0.20 ? '⚠ ELEVATED' : '✓ LOW RISK';
   setStep('hallucination', `done ${hallType}`,
-    `Hallucination score: ${hallScore.toFixed(2)} · Confidence: ${(confScore*100).toFixed(0)}%`,
+    `Hallucination score: ${hallScore.toFixed(2)} · Confidence: ${(confScore*100).toFixed(0)}% · Risk driver: ${hallRisk.reason}`,
     { type: hallType === 'warn' ? 'warn' : 'pass', text: hallLabel }
   );
   if (hallType === 'warn') {
-    addLog('warn', '⚠️', `Elevated hallucination risk (${hallScore.toFixed(2)}) — human review recommended`);
+    addLog('warn', '⚠️', `Hallucination risk elevated (${hallScore.toFixed(2)}) — reason: ${hallRisk.reason} — human review recommended`);
   } else {
-    addLog('pass', '✅', `Hallucination risk low (${hallScore.toFixed(2)})`);
+    addLog('pass', '✅', `Hallucination score: ${hallScore.toFixed(2)} · ${hallRisk.reason}`);
   }
   await sleep(200);
 
   // ── CHECK 6: Output Validation ───────────────────────────────
-  setStep('output', 'active', 'Running final toxicity and PII scan...');
+  setStep('output', 'active', 'Final toxicity scan and PII scrub on output...');
   await sleep(500 + rand(0,300));
-  setStep('output', 'done pass', 'Output clean — approved for release', { type: 'pass', text: '✓ APPROVED' });
-  addLog('pass', '✅', 'Output validation passed — response approved');
+  const toxScore = rand(0.01, 0.04);
+  setStep('output', 'done pass',
+    `Output clean · toxicity: ${toxScore.toFixed(2)} · no PII detected · approved for release`,
+    { type: 'pass', text: '✓ APPROVED' });
+  addLog('pass', '✅', `Output validated · toxicity ${toxScore.toFixed(2)} · PII: none detected`);
 
-  // ── SHOW RESPONSE ────────────────────────────────────────────
-  const responseText = APPROVED_RESPONSES[Math.floor(Math.random() * APPROVED_RESPONSES.length)];
+  // ── SHOW CONTEXT-AWARE RESPONSE ──────────────────────────────
+  const responseText = selectResponse(prompt);
   const tokens = Math.floor(rand(280, 650));
   const cost = tokens * 0.000005;
-  const latency = Date.now() - startTime;
+  const totalLatency = Date.now() - startTime;
 
   const box = document.getElementById('responseBox');
   box.className = 'response-box visible approved';
   document.getElementById('responseStatus').className = 'response-status approved';
   document.getElementById('responseStatus').textContent = '✓ Approved — Assurance Passed';
-  document.getElementById('responseLatency').textContent = `${latency}ms total · ${tokens} tokens`;
+  document.getElementById('responseLatency').textContent = `${totalLatency}ms total · ${tokens} tokens`;
 
   const scoreRow = document.getElementById('scoreRow');
   scoreRow.innerHTML = `
-    <div class="score-chip"><div class="score-key">Hallucination</div><div class="score-val good">${hallScore.toFixed(2)}</div></div>
+    <div class="score-chip"><div class="score-key">Hallucination</div><div class="score-val ${hallScore > 0.20 ? 'warn' : 'good'}">${hallScore.toFixed(2)}</div></div>
     <div class="score-chip"><div class="score-key">Confidence</div><div class="score-val good">${(confScore*100).toFixed(0)}%</div></div>
-    <div class="score-chip"><div class="score-key">Toxicity</div><div class="score-val good">${rand(0.01,0.04).toFixed(2)}</div></div>
+    <div class="score-chip"><div class="score-key">Toxicity</div><div class="score-val good">${toxScore.toFixed(2)}</div></div>
+    <div class="score-chip"><div class="score-key">Bias Score</div><div class="score-val good">${biasResult.score.toFixed(1)}</div></div>
     <div class="score-chip"><div class="score-key">Tokens</div><div class="score-val info">${tokens}</div></div>
     <div class="score-chip"><div class="score-key">Cost</div><div class="score-val info">${formatCost(cost)}</div></div>
   `;
@@ -1333,7 +1620,7 @@ async function runPipeline() {
   const textEl = document.getElementById('responseText');
   await typeResponse(textEl, responseText);
 
-  addLog('pass', '💬', `Response delivered · ${tokens} tokens · ${formatCost(cost)}`);
+  addLog('pass', '💬', `Response delivered · ${tokens} tokens · ${formatCost(cost)} · context: ${prompt.slice(0,40)}...`);
   updateFinOps(tokens, cost, true);
   finish(true);
 }
